@@ -1,0 +1,58 @@
+{
+  "name": "placegame-auto-helper",
+  "version": "0.1.7",
+  "description": "复古打宝挂机强化、金币材料、世界BOSS、自动爬塔与自动领奖桌面助手",
+  "main": "main.js",
+  "private": true,
+  "author": "local",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "test:helper": "electron tests/helper.electron.cjs",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis portable",
+    "portable": "node scripts/build-portable.cjs"
+  },
+  "devDependencies": {
+    "@electron/packager": "19.0.2",
+    "@electron/asar": "3.4.1",
+    "electron": "44.4.1",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "cn.placegame.autohelper",
+    "productName": "复古打宝挂机助手",
+    "artifactName": "${productName}-${version}-${arch}.${ext}",
+    "asar": true,
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer-helper.js",
+      "assets/**/*",
+      "README.md"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "verifyUpdateCodeSignature": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "复古打宝挂机助手"
+    }
+  }
+}
