@@ -46,6 +46,8 @@
     bossLoop: true,
     bossMaxAttempts: 20,
     bossDelayMs: 1500,
+    bossPersonalAttempts: 1,
+    bossPersonalAppend: false,
     towerTarget: 100,
     towerDelayMs: 1500,
   };
@@ -70,6 +72,10 @@
   let settings = loadSettings();
   const selectedEquipmentIds = new Set();
   const selectedBossKeys = new Set();
+  const selectedPersonalBossKeys = new Set();
+  const selectedMapBossKeys = new Set();
+  const personalBossAttempts = new Map();
+  const appendedPersonalBossKeys = new Set();
   let equipmentSelectionInitialized = false;
   let bossSelectionInitialized = false;
 
@@ -365,6 +371,17 @@
     return payload.result || payload.data || {};
   }
 
+  function normalizeMail(mail) {
+    if (!mail || typeof mail !== "object") return mail;
+    const reward = {
+      ...(mail.reward && typeof mail.reward === "object" ? mail.reward : {}),
+      ...(mail.rewardGold !== undefined ? { gold: mail.rewardGold } : {}),
+      ...(mail.rewardRareCoin !== undefined ? { rareCoin: mail.rewardRareCoin } : {}),
+      ...(mail.rewardRareCoinFragments !== undefined ? { rareCoinFragments: mail.rewardRareCoinFragments } : {}),
+    };
+    return { ...mail, id: mail.id ?? mail.mailId, claimed: Boolean(mail.claimed), reward };
+  }
+
   async function loadState() {
     const payload = await request("/api/client/bootstrap", {
       method: "GET",
@@ -376,6 +393,7 @@
     }
     currentState = {
       ...currentState, ...state,
+      mails: Array.isArray(state.mails) ? state.mails.map(normalizeMail) : state.mails,
       bosses: currentState && currentState.bosses || state.bosses,
       tower: currentState && currentState.tower || state.tower,
     };
@@ -390,7 +408,7 @@
     });
     const data = dataFromPayload(payload);
     if (!Array.isArray(data.bosses)) {
-      throw new ApiError("没有读取到世界BOSS列表，请刷新后重试。", 0);
+      throw new ApiError("没有读取到首领列表，请刷新后重试。", 0);
     }
     currentState = { ...currentState, bosses: data.bosses };
     return currentState;
@@ -547,6 +565,46 @@
     );
   }
 
+  function personalBosses(state) {
+    return (Array.isArray(state && state.bosses) ? state.bosses : []).filter(
+      (boss) => boss && boss.type === "personal" && boss.key,
+    );
+  }
+
+  function mapBosses(state) {
+    return (Array.isArray(state && state.bosses) ? state.bosses : []).filter(
+      (boss) => boss && boss.type === "map" && boss.key,
+    );
+  }
+
+  function bossAttemptState(boss) {
+    if (!boss || typeof boss !== "object") return undefined;
+    return boss.personalInstance || boss.mapInstance || boss.instance || boss.challengeState;
+  }
+
+  function bossRemainingAttempts(boss) {
+    const instance = bossAttemptState(boss);
+    const values = [
+      instance && instance.remainingAttemptCount,
+      instance && instance.remainingAttempts,
+      instance && instance.attemptsRemaining,
+      boss && boss.remainingAttemptCount,
+      boss && boss.remainingAttempts,
+      boss && boss.attemptsRemaining,
+    ];
+    const value = values.find((candidate) => candidate !== undefined && candidate !== null);
+    return value === undefined ? undefined : numberOr(value, 0);
+  }
+
+  function soloBossAvailable(boss) {
+    if (!boss || boss.blockedReason || boss.assistBlockedReason ||
+        boss.canChallenge === false || boss.available === false) return false;
+    const instance = bossAttemptState(boss);
+    if (instance && instance.status && ["ended", "closed", "locked"].includes(instance.status)) return false;
+    const remaining = bossRemainingAttempts(boss);
+    return remaining === undefined || remaining > 0;
+  }
+
   function worldBossAvailable(boss) {
     if (!boss) return false;
     const instance = boss.worldInstance;
@@ -562,6 +620,33 @@
     const status =
       instance.status === "active" ? "开放" : instance.status || "未开放";
     return `${boss.name || boss.key} · ${status} · 剩余 ${numberOr(instance.remainingAttemptCount, 0)} 次`;
+  }
+
+  function bossChallengeBody(boss) {
+    const body = { bossKey: boss.key };
+    const options = boss && boss.challengeOptions;
+    const difficulties = Array.isArray(boss && boss.difficultyOptions)
+      ? boss.difficultyOptions : [];
+    const skills = options && Array.isArray(options.skills) ? options.skills : [];
+    const buffs = options && Array.isArray(options.buffs) ? options.buffs : [];
+    const affixes = options && Array.isArray(options.affixes) ? options.affixes : [];
+    const targets = options && Array.isArray(options.targetSlots) ? options.targetSlots : [];
+    if (options || difficulties.length) {
+      body.difficulty = difficulties[0] && difficulties[0].key || "normal";
+      body.selectedSkillKeys = skills.slice(0, 3).map((skill) => skill && skill.key).filter(Boolean);
+      body.buffKey = buffs[0] && buffs[0].key || "none";
+      body.affixKey = affixes[0] && affixes[0].key || "none";
+      if (targets[0]) body.targetSlot = targets[0].key || targets[0];
+      body.useMaterialBoost = false;
+    }
+    return body;
+  }
+
+  function bossResultSummary(result) {
+    const events = result && result.battle && result.battle.events;
+    const terminal = Array.isArray(events) && events.find((event) =>
+      event && ["victory", "defeat"].includes(event.type));
+    return terminal ? terminal.type : undefined;
   }
 
   function addLog(message, level = "info") {
@@ -722,6 +807,14 @@
     ];
   }
 
+  function mailClaimCount(state = currentState) {
+    return (Array.isArray(state && state.mails) ? state.mails : [])
+      .filter((mail) => mail && mail.claimed !== true &&
+        (!mail.expiresAt || Number(mail.expiresAt) > Date.now()) &&
+        mail.reward && typeof mail.reward === "object" &&
+        Object.values(mail.reward).some((value) => Number(value) > 0 || (Array.isArray(value) && value.length > 0))).length;
+  }
+
   function renderRewardState() {
     if (!panel || !panel.rewardGuildDetail) return;
     const guild = currentState && currentState.guildRewards;
@@ -730,6 +823,8 @@
     const activityActions = activityRewardActions();
     panel.rewardGuildCount.textContent = String(guildActions.length);
     panel.rewardActivityCount.textContent = String(activityActions.length);
+    const mailCount = mailClaimCount();
+    panel.rewardMailCount.textContent = String(mailCount);
     panel.rewardGuildDetail.textContent = !guild
       ? "请刷新公会奖励状态"
       : guild.joined !== true
@@ -740,13 +835,17 @@
     panel.rewardActivityDetail.textContent = !currentState || !activity
       ? "请刷新活动奖励状态"
       : `当前活跃 ${activityRewardScore()} · 签到、活跃箱、任务、成就、图鉴、推币场`;
+    panel.rewardMailDetail.textContent = currentState && Array.isArray(currentState.mails)
+      ? (mailCount ? `${mailCount} 封系统邮件有待领取附件` : "当前没有待领取的系统邮件附件")
+      : "请刷新系统邮件状态";
     panel.claimGuild.dataset.unavailable = String(!guild || guildActions.length === 0);
     panel.claimActivity.dataset.unavailable = String(!activity || activityActions.length === 0);
     panel.claimAll.dataset.unavailable = String(
       !guild || !activity || guildActions.length + activityActions.length === 0,
     );
-    panel.rewardEstimate.textContent = guildActions.length + activityActions.length
-      ? `共 ${guildActions.length + activityActions.length} 项可领取：公会 ${guildActions.length} 项，活动 ${activityActions.length} 项。`
+    panel.claimMail.dataset.unavailable = String(mailCount === 0);
+    panel.rewardEstimate.textContent = guildActions.length + activityActions.length + mailCount
+      ? `共 ${guildActions.length + activityActions.length + mailCount} 项可领取：公会 ${guildActions.length} 项，活动 ${activityActions.length} 项，邮件 ${mailCount} 项。`
       : "当前没有可领取项目；刷新后会按服务器状态重新检查。";
   }
 
@@ -922,62 +1021,140 @@
   }
 
   function bossAvailabilityText(boss) {
-    const instance = boss.worldInstance;
+    const instance = boss.worldInstance || bossAttemptState(boss);
     if (boss.assistBlockedReason) return boss.assistBlockedReason;
-    if (!instance) return "服务器未返回当前场次";
-    if (instance.status !== "active") return "当前场次未开放";
-    if (numberOr(instance.remainingAttemptCount, 0) <= 0)
-      return "本场次数已用完";
-    return `阶段 ${numberOr(instance.phase, 1)} · 进度 ${numberOr(instance.phaseProgressPercent, 0)}% · 剩余 ${numberOr(instance.remainingAttemptCount, 0)} 次`;
+    if (boss.blockedReason) return boss.blockedReason;
+    if (instance && instance.status && instance.status !== "active") return "当前场次未开放";
+    const remaining = bossRemainingAttempts(boss);
+    if (remaining !== undefined && remaining <= 0) return "本场次数已用完";
+    if (boss.type === "world") {
+      if (!instance) return "服务器未返回当前场次";
+      return `阶段 ${numberOr(instance.phase, 1)} · 进度 ${numberOr(instance.phaseProgressPercent, 0)}% · 剩余 ${numberOr(instance.remainingAttemptCount, 0)} 次`;
+    }
+    return remaining === undefined ? "可挑战" : `剩余 ${remaining} 次 · 可挑战`;
   }
 
   function createBossRows(state) {
     if (!panel) return;
     const list = panel.bossList;
     list.replaceChildren();
-    const bosses = worldBosses(state);
-    if (!bosses.length) {
+    const groups = [
+      { key: "personal", title: "个人首领", note: "选中后设置挑战次数，可勾选追加挑战", bosses: personalBosses(state) },
+      { key: "map", title: "地图首领", note: "支持多选，一键挑战全部已选首领", bosses: mapBosses(state) },
+      { key: "world", title: "世界首领", note: "全服协作场次", bosses: worldBosses(state) },
+    ].filter((group) => group.bosses.length);
+    if (!groups.length) {
       const empty = document.createElement("p");
       empty.className = "pg-empty";
-      empty.textContent = "暂未读取到世界BOSS。";
+      empty.textContent = "暂未读取到首领列表。";
       list.appendChild(empty);
       return;
     }
-    if (!bossSelectionInitialized ||
-        (!taskRunning() && settings.bossScope === "all")) {
+    if (!bossSelectionInitialized || (!taskRunning() && settings.bossScope === "all")) {
       selectedBossKeys.clear();
-      bosses
-        .filter(worldBossAvailable)
-        .forEach((boss) => selectedBossKeys.add(String(boss.key)));
+      selectedPersonalBossKeys.clear();
+      selectedMapBossKeys.clear();
+      for (const group of groups) {
+        for (const boss of group.bosses) {
+          if (!((boss.type === "world" ? worldBossAvailable(boss) : soloBossAvailable(boss)))) continue;
+          if (group.key === "world") selectedBossKeys.add(String(boss.key));
+          if (group.key === "personal") selectedPersonalBossKeys.add(String(boss.key));
+          if (group.key === "map") selectedMapBossKeys.add(String(boss.key));
+        }
+      }
       bossSelectionInitialized = true;
     }
-    for (const boss of bosses) {
-      const key = String(boss.key);
-      const row = document.createElement("label");
-      row.className = `pg-check-row ${worldBossAvailable(boss) ? "" : "pg-disabled-row"}`;
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = selectedBossKeys.has(key);
-      checkbox.dataset.unavailable = String(!worldBossAvailable(boss));
-      checkbox.disabled = busy() || !worldBossAvailable(boss);
-      checkbox.dataset.bossKey = key;
-      checkbox.addEventListener("change", () => {
-        if (busy()) return;
-        if (checkbox.checked) selectedBossKeys.add(key);
-        else selectedBossKeys.delete(key);
-        settings.bossScope = "selected";
-        panel.bossScope.value = "selected";
-        saveSettings();
-      });
-      const copy = document.createElement("span");
-      const title = document.createElement("strong");
-      title.textContent = boss.name || key;
-      const detail = document.createElement("small");
-      detail.textContent = `${boss.mapName || "世界首领"} · ${bossAvailabilityText(boss)}`;
-      copy.append(title, detail);
-      row.append(checkbox, copy);
-      list.appendChild(row);
-    }
+    const appendGroup = (group) => {
+      const heading = document.createElement("div");
+      heading.className = "pg-section-title pg-boss-group-title";
+      const headingText = document.createElement("span");
+      headingText.textContent = `${group.title} · ${group.note}`;
+      heading.appendChild(headingText);
+      if (group.key === "map") {
+        const allButton = document.createElement("button");
+        allButton.type = "button";
+        allButton.dataset.action = "select-all-map";
+        allButton.textContent = group.bosses.every((boss) => !soloBossAvailable(boss) || selectedMapBossKeys.has(String(boss.key))) ? "取消全选" : "一键全选";
+        allButton.disabled = busy();
+        allButton.addEventListener("click", () => {
+          if (busy()) return;
+          const available = group.bosses.filter(soloBossAvailable);
+          const allSelected = available.every((boss) => selectedMapBossKeys.has(String(boss.key)));
+          available.forEach((boss) => {
+            const key = String(boss.key);
+            if (allSelected) selectedMapBossKeys.delete(key);
+            else selectedMapBossKeys.add(key);
+          });
+          settings.bossScope = "selected";
+          panel.bossScope.value = "selected";
+          saveSettings();
+          createBossRows(currentState);
+        });
+        heading.appendChild(allButton);
+      }
+      list.appendChild(heading);
+      for (const boss of group.bosses) {
+        const key = String(boss.key);
+        const available = group.key === "world" ? worldBossAvailable(boss) : soloBossAvailable(boss);
+        const row = document.createElement("div");
+        row.className = `pg-check-row ${available ? "" : "pg-disabled-row"}`;
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = group.key === "world" ? selectedBossKeys.has(key) : group.key === "map" ? selectedMapBossKeys.has(key) : selectedPersonalBossKeys.has(key);
+        checkbox.dataset.unavailable = String(!available);
+        checkbox.disabled = busy() || !available;
+        checkbox.dataset.bossKey = key;
+        checkbox.addEventListener("change", () => {
+          if (busy()) return;
+          const selected = group.key === "world" ? selectedBossKeys : group.key === "map" ? selectedMapBossKeys : selectedPersonalBossKeys;
+          if (checkbox.checked) selected.add(key); else selected.delete(key);
+          settings.bossScope = "selected";
+          panel.bossScope.value = "selected";
+          saveSettings();
+        });
+        const copy = document.createElement("span");
+        const title = document.createElement("strong");
+        title.textContent = boss.name || key;
+        const detail = document.createElement("small");
+        detail.textContent = `${boss.mapName || (group.key === "world" ? "世界首领" : group.title)} · ${bossAvailabilityText(boss)}`;
+        copy.append(title, detail);
+        row.append(checkbox, copy);
+        if (group.key === "personal") {
+          const count = document.createElement("input");
+          count.type = "number";
+          count.min = "1";
+          count.max = "100";
+          count.step = "1";
+          count.className = "pg-boss-count";
+          count.title = "挑战次数";
+          count.setAttribute("aria-label", `${title.textContent}挑战次数`);
+          count.dataset.personalAttempts = key;
+          count.value = String(personalBossAttempts.get(key) || settings.bossPersonalAttempts);
+          count.disabled = busy() || !available;
+          count.addEventListener("change", () => {
+            personalBossAttempts.set(key, integerSetting(count.value, 1, 100, settings.bossPersonalAttempts));
+            count.value = String(personalBossAttempts.get(key));
+            saveSettings();
+          });
+          const append = document.createElement("label");
+          append.className = "pg-inline-check";
+          const appendInput = document.createElement("input");
+          appendInput.type = "checkbox";
+          appendInput.checked = appendedPersonalBossKeys.has(key);
+          appendInput.dataset.personalAppend = key;
+          appendInput.disabled = busy() || !available;
+          appendInput.title = "追加挑战";
+          appendInput.addEventListener("change", () => {
+            if (appendInput.checked) appendedPersonalBossKeys.add(key); else appendedPersonalBossKeys.delete(key);
+            saveSettings();
+          });
+          append.append(appendInput, document.createTextNode("追加"));
+          row.append(count, append);
+        }
+        list.appendChild(row);
+      }
+    };
+    groups.forEach(appendGroup);
   }
 
   async function refreshState(silent = false) {
@@ -1053,6 +1230,16 @@
     return bosses.filter((boss) => selectedBossKeys.has(String(boss.key)));
   }
 
+  function selectedPersonalBossCandidates(state) {
+    return personalBosses(state).filter(soloBossAvailable)
+      .filter((boss) => selectedPersonalBossKeys.has(String(boss.key)));
+  }
+
+  function selectedMapBossCandidates(state) {
+    return mapBosses(state).filter(soloBossAvailable)
+      .filter((boss) => selectedMapBossKeys.has(String(boss.key)));
+  }
+
   function stopReasonForError(error) {
     if (!(error instanceof ApiError))
       return error instanceof Error ? error.message : "未知错误";
@@ -1122,6 +1309,15 @@
       60_000,
       DEFAULT_SETTINGS.bossDelayMs,
     );
+    settings.bossPersonalAttempts = integerSetting(
+      panel.bossPersonalAttempts && panel.bossPersonalAttempts.value,
+      1,
+      100,
+      DEFAULT_SETTINGS.bossPersonalAttempts,
+    );
+    settings.bossPersonalAppend = Boolean(
+      panel.bossPersonalAppend && panel.bossPersonalAppend.checked,
+    );
     saveSettings();
   }
 
@@ -1148,12 +1344,13 @@
       : "开始自动强化";
     panel.bossStart.textContent = bossRunning
       ? "BOSS 运行中…"
-      : "一键挑战世界BOSS";
+      : "一键挑战选中首领";
     panel.towerStart.textContent = towerRunning ? "爬塔运行中…" : "开始自动爬塔";
     for (const [button, scope, idleText] of [
       [panel.claimGuild, "guild", "领取公会奖励"],
       [panel.claimActivity, "activity", "领取活动奖励"],
       [panel.claimAll, "all", "一键领取全部"],
+      [panel.claimMail, "mail", "一键领取邮件"],
     ]) {
       button.disabled = running || button.dataset.unavailable === "true";
       button.textContent = rewardRunning && rewardRunScope === scope ? "领取中…" : idleText;
@@ -1346,70 +1543,86 @@
     if (busy()) return;
     readBossSettingsFromUi();
     const runSettings = Object.freeze({ ...settings });
-    const instances = new Map(selectedWorldBossCandidates(currentState).map((boss) =>
-      [String(boss.key), String(boss.worldInstance.instanceId)],
-    ));
-    if (!instances.size) {
-      addLog("未勾选可用世界BOSS。请先刷新列表并选择开放的场次。", "warn");
+    let state = currentState;
+    const selectedPersonal = selectedPersonalBossCandidates(state).map((boss) => ({
+      boss,
+      count: appendedPersonalBossKeys.has(String(boss.key))
+        ? integerSetting(personalBossAttempts.get(String(boss.key)), 1, 100, runSettings.bossPersonalAttempts)
+        : 1,
+    }));
+    const selectedMap = selectedMapBossCandidates(state);
+    const selectedWorld = selectedWorldBossCandidates(state);
+    if (!selectedPersonal.length && !selectedMap.length && !selectedWorld.length) {
+      addLog("未勾选可用首领。请先刷新列表并选择个人、地图或世界首领。", "warn");
       return;
     }
     bossRunning = true;
     stopRequested = false;
     updateButtons();
-    addLog(
-      `开始世界BOSS协作：${runSettings.bossLoop ? "循环至次数用完（受上限约束）" : "每个选中场次一次"}。`,
-    );
-    setStatus("世界BOSS运行中…", "busy");
+    addLog(`开始首领挑战：个人 ${selectedPersonal.length} 个，地图 ${selectedMap.length} 个，世界 ${selectedWorld.length} 个。`);
+    setStatus("首领挑战运行中…", "busy");
     let attempts = 0;
-    const bossAttempts = new Map();
+    const worldAttempts = new Map();
     try {
-      let state = await loadBossState();
+      state = await loadBossState();
       createBossRows(state);
+      const soloQueue = [];
+      selectedPersonal.forEach(({ boss, count }) => {
+        for (let index = 0; index < count; index += 1) soloQueue.push({ boss, kind: "个人" });
+      });
+      selectedMap.forEach((boss) => soloQueue.push({ boss, kind: "地图" }));
+      for (const entry of soloQueue) {
+        if (stopRequested || attempts >= runSettings.bossMaxAttempts) break;
+        const boss = entry.boss;
+        addLog(`挑战${entry.kind}首领 ${boss.name || boss.key}（第 ${attempts + 1} 次）。`);
+        const payload = await request("/api/boss/challenge", {
+          method: "POST",
+          body: bossChallengeBody(boss),
+          responseState: "omit",
+          timeoutMs: 15_000,
+          idempotencyKey: makeIdempotencyKey(),
+        }, false);
+        const result = dataFromPayload(payload);
+        attempts += 1;
+        const outcome = bossResultSummary(result);
+        addLog(`${boss.name || boss.key}：${outcome === "defeat" ? "挑战失败" : outcome === "victory" ? "挑战胜利" : "挑战请求已完成"}。`, outcome === "defeat" ? "warn" : "success");
+        if (outcome === "defeat") break;
+        if (!stopRequested) await sleep(runSettings.bossDelayMs);
+        if (stopRequested) break;
+        state = await loadBossState();
+        createBossRows(state);
+      }
       while (!stopRequested && attempts < runSettings.bossMaxAttempts) {
         const candidates = worldBosses(state).filter((boss) =>
-          worldBossAvailable(boss) && instances.has(String(boss.key)) &&
-          instances.get(String(boss.key)) === String(boss.worldInstance.instanceId) &&
-          (runSettings.bossLoop || !bossAttempts.has(String(boss.key))),
+          worldBossAvailable(boss) && selectedWorld.some((entry) => String(entry.key) === String(boss.key)) &&
+          (runSettings.bossLoop || !worldAttempts.has(String(boss.key))),
         ).sort((left, right) =>
-          (bossAttempts.get(String(left.key)) || 0) - (bossAttempts.get(String(right.key)) || 0),
+          (worldAttempts.get(String(left.key)) || 0) - (worldAttempts.get(String(right.key)) || 0),
         );
-        if (!candidates.length) {
-          addLog("本轮目标场次已处理完毕或暂无可参与次数。");
-          break;
-        }
-          const boss = candidates[0];
-          addLog(
-            `提交 ${boss.name || boss.key} 世界协作攻击（第 ${attempts + 1} 次）。`,
-          );
-          const payload = await request("/api/boss/assist", {
-            method: "POST",
-            body: { bossKey: boss.key },
-            responseState: "omit",
-          });
-          const result = dataFromPayload(payload);
-          const world = result.worldBoss || {};
-          attempts += 1;
-          bossAttempts.set(String(boss.key), (bossAttempts.get(String(boss.key)) || 0) + 1);
-          addLog(
-            `${boss.name || boss.key}：造成 ${formatNumber(result.damage)} 点伤害；阶段 ${numberOr(world.phase, 1)}，进度 ${numberOr(world.phaseProgressPercent, 0)}%，剩余 ${numberOr(world.remainingAttemptCount, 0)} 次。`,
-            "success",
-          );
-          if (stopRequested) break;
-          await sleep(runSettings.bossDelayMs);
-          if (stopRequested) break;
-          state = await loadBossState();
-          createBossRows(state);
+        if (!candidates.length) break;
+        const boss = candidates[0];
+        addLog(`提交 ${boss.name || boss.key} 世界协作攻击（第 ${attempts + 1} 次）。`);
+        const payload = await request("/api/boss/assist", {
+          method: "POST", body: { bossKey: boss.key }, responseState: "omit",
+        });
+        const result = dataFromPayload(payload);
+        const world = result.worldBoss || {};
+        attempts += 1;
+        worldAttempts.set(String(boss.key), (worldAttempts.get(String(boss.key)) || 0) + 1);
+        addLog(`${boss.name || boss.key}：造成 ${formatNumber(result.damage)} 点伤害；阶段 ${numberOr(world.phase, 1)}，进度 ${numberOr(world.phaseProgressPercent, 0)}%，剩余 ${numberOr(world.remainingAttemptCount, 0)} 次。`, "success");
+        if (stopRequested) break;
+        await sleep(runSettings.bossDelayMs);
+        if (stopRequested) break;
+        state = await loadBossState();
+        createBossRows(state);
       }
       if (attempts >= runSettings.bossMaxAttempts)
-        addLog(
-          `达到本次世界BOSS最大次数 ${runSettings.bossMaxAttempts}，已停止。`,
-          "warn",
-        );
-      if (stopRequested) addLog("收到停止请求，世界BOSS操作已停止。", "warn");
-      setStatus("世界BOSS操作已停止", "ok");
+        addLog(`达到本次最大首领挑战次数 ${runSettings.bossMaxAttempts}，已停止。`, "warn");
+      if (stopRequested) addLog("收到停止请求，首领挑战已停止。", "warn");
+      setStatus("首领挑战已停止", "ok");
     } catch (error) {
       const message = stopReasonForError(error);
-      addLog(`世界BOSS停止：${message}`, "error");
+      addLog(`首领挑战停止：${message}`, "error");
       setStatus(message, "error");
     } finally {
       bossRunning = false;
@@ -1527,7 +1740,7 @@
   }
 
   async function runRewardClaims(scope) {
-    if (busy() || !["guild", "activity", "all"].includes(scope)) return;
+    if (busy() || !["guild", "activity", "mail", "all"].includes(scope)) return;
     rewardRunning = true;
     rewardRunScope = scope;
     stopRequested = false;
@@ -1539,6 +1752,24 @@
     try {
       while (!stopRequested && claimed < REWARD_CLAIM_LIMIT) {
         setStatus("正在核对可领取奖励…", "busy");
+        if (scope === "mail") {
+          await loadRewardSources("mail");
+          if (stopRequested) break;
+          const mailCount = mailClaimCount();
+          if (!mailCount) {
+            finish = claimed ? `系统邮件领取完成，共领取 ${claimed} 项` : "当前没有可领取的系统邮件";
+            break;
+          }
+          pendingAction = { label: "系统邮件附件" };
+          await request("/api/mail/claim-all", {
+            method: "POST", body: {}, responseState: "omit", idempotencyKey: makeIdempotencyKey(),
+          }, false);
+          claimed = mailCount;
+          pendingAction = undefined;
+          addLog(`系统邮件一键领取成功，共 ${mailCount} 封。`, "success");
+          finish = `系统邮件领取完成，共领取 ${mailCount} 封`;
+          break;
+        }
         await loadRewardSources(scope);
         if (stopRequested) break;
         const available = rewardActions(scope);
@@ -1695,6 +1926,11 @@
         .pg-check-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .pg-check-row strong, .pg-check-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .pg-check-row small { color: #7e90a4; font-size: 11px; }
+        .pg-boss-group-title { margin: 10px 0 4px; font-size: 12px; color: #9db4cc; }
+        .pg-boss-group-title button { color: #bde4ff; border-color: #3c6688; }
+        .pg-boss-count { width: 54px !important; flex: 0 0 54px; margin-left: auto; padding: 5px !important; }
+        .pg-inline-check { display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; color: #9db4cc; font-size: 11px; }
+        .pg-inline-check input { width: 14px; height: 14px; }
         .pg-disabled-row { opacity: .45; }
         .pg-shop-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 3px; color: #d0dae8; }
         .pg-shop-row + .pg-shop-row { border-top: 1px solid #1a2838; }
@@ -1769,15 +2005,17 @@
         </section>
         <section class="pg-tab-panel" data-panel="boss" hidden>
           <div class="pg-grid">
-            <label class="pg-field"><span>挑战范围</span><select data-ref="bossScope"><option value="all">所有可用世界BOSS</option><option value="selected">仅勾选BOSS</option></select></label>
-            <label class="pg-field"><span>本次最大次数</span><input data-ref="bossMaxAttempts" type="number" min="1" max="500"></label>
+            <label class="pg-field"><span>挑战范围</span><select data-ref="bossScope"><option value="all">所有可用首领</option><option value="selected">仅勾选首领</option></select></label>
+            <label class="pg-field"><span>本次最大总次数</span><input data-ref="bossMaxAttempts" type="number" min="1" max="500"></label>
             <label class="pg-field"><span>每次间隔（毫秒）</span><input data-ref="bossDelay" type="number" min="500" step="100"></label>
+            <label class="pg-field"><span>个人首领默认次数</span><input data-ref="bossPersonalAttempts" type="number" min="1" max="100"></label>
           </div>
           <label class="pg-check"><input data-ref="bossLoop" type="checkbox">循环参与，直到没有可用次数</label>
-          <div class="pg-section-title"><span>世界BOSS列表</span><button data-action="refresh-boss">刷新</button></div>
+          <label class="pg-check"><input data-ref="bossPersonalAppend" type="checkbox">个人首领追加挑战（按每行次数继续挑战）</label>
+          <div class="pg-section-title"><span>首领列表</span><button data-action="refresh-boss">刷新</button></div>
           <div class="pg-list" data-ref="bossList"></div>
-          <div class="pg-actions"><button class="pg-primary" data-action="start-boss">一键挑战世界BOSS</button><button class="pg-danger" data-action="stop">停止</button></div>
-          <p class="pg-note">每次参与消耗游戏设定的首领门票；脚本遵循服务器返回的剩余次数和开放状态。</p>
+          <div class="pg-actions"><button class="pg-primary" data-action="start-boss">一键挑战选中首领</button><button class="pg-danger" data-action="stop">停止</button></div>
+          <p class="pg-note">个人首领按每行次数挑战；地图首领支持多选和一键全选；世界首领遵循服务器返回的协作次数和开放状态。</p>
         </section>
         <section class="pg-tab-panel" data-panel="tower" hidden>
           <div class="pg-section-title"><span>试炼之塔</span><button data-action="refresh-tower">刷新</button></div>
@@ -1795,9 +2033,10 @@
           <div class="pg-list pg-reward-list">
             <div class="pg-reward-row"><span><strong>公会奖励</strong><small data-ref="rewardGuildDetail">正在读取分红与进度奖励…</small></span><b class="pg-reward-count" data-ref="rewardGuildCount" aria-label="公会可领取数量">–</b></div>
             <div class="pg-reward-row"><span><strong>活动奖励</strong><small data-ref="rewardActivityDetail">正在读取签到与活动奖励…</small></span><b class="pg-reward-count" data-ref="rewardActivityCount" aria-label="活动可领取数量">–</b></div>
+            <div class="pg-reward-row"><span><strong>系统邮件</strong><small data-ref="rewardMailDetail">正在读取系统邮件…</small></span><b class="pg-reward-count" data-ref="rewardMailCount" aria-label="邮件可领取数量">–</b></div>
           </div>
           <p class="pg-note" data-ref="rewardEstimate" aria-live="polite">正在检查可领取项目…</p>
-          <div class="pg-actions"><button class="pg-primary" data-action="claim-all" data-unavailable="true">一键领取全部</button><button class="pg-danger" data-action="stop">停止</button></div>
+          <div class="pg-actions"><button class="pg-primary" data-action="claim-all" data-unavailable="true">一键领取全部</button><button data-action="claim-mail" data-unavailable="true">一键领取邮件</button><button class="pg-danger" data-action="stop">停止</button></div>
           <div class="pg-actions pg-reward-secondary"><button data-action="claim-guild" data-unavailable="true">领取公会奖励</button><button data-action="claim-activity" data-unavailable="true">领取活动奖励</button></div>
           <p class="pg-note">仅领取服务器标记为可领取的免费项目：公会分红、捐献进度、签到、活跃箱、任务、成就、图鉴和推币场已解锁奖励。不会开始小游戏、购买彩票、兑换、捐献或执行付费功能。</p>
         </section>
@@ -1826,10 +2065,13 @@
       rewardGuildCount: get('[data-ref="rewardGuildCount"]'),
       rewardActivityDetail: get('[data-ref="rewardActivityDetail"]'),
       rewardActivityCount: get('[data-ref="rewardActivityCount"]'),
+      rewardMailDetail: get('[data-ref="rewardMailDetail"]'),
+      rewardMailCount: get('[data-ref="rewardMailCount"]'),
       rewardEstimate: get('[data-ref="rewardEstimate"]'),
       claimGuild: get('[data-action="claim-guild"]'),
       claimActivity: get('[data-action="claim-activity"]'),
       claimAll: get('[data-action="claim-all"]'),
+      claimMail: get('[data-action="claim-mail"]'),
       refreshRewards: get('[data-action="refresh-rewards"]'),
       bossList: get('[data-ref="bossList"]'),
       log: get('[data-ref="log"]'),
@@ -1845,6 +2087,8 @@
       bossMaxAttempts: get('[data-ref="bossMaxAttempts"]'),
       bossDelay: get('[data-ref="bossDelay"]'),
       bossLoop: get('[data-ref="bossLoop"]'),
+      bossPersonalAttempts: get('[data-ref="bossPersonalAttempts"]'),
+      bossPersonalAppend: get('[data-ref="bossPersonalAppend"]'),
       enhanceStart: get('[data-action="start-enhance"]'),
       bossStart: get('[data-action="start-boss"]'),
       refreshEquipment: get('[data-action="refresh-equipment"]'),
@@ -1866,6 +2110,8 @@
     setInputValue(panel.bossMaxAttempts, settings.bossMaxAttempts);
     setInputValue(panel.bossDelay, settings.bossDelayMs);
     panel.bossLoop.checked = Boolean(settings.bossLoop);
+    setInputValue(panel.bossPersonalAttempts, settings.bossPersonalAttempts);
+    panel.bossPersonalAppend.checked = Boolean(settings.bossPersonalAppend);
     setInputValue(panel.towerTarget, settings.towerTarget);
     setInputValue(panel.towerDelay, settings.towerDelayMs);
 
@@ -1902,6 +2148,7 @@
     panel.claimGuild.addEventListener("click", () => void runRewardClaims("guild"));
     panel.claimActivity.addEventListener("click", () => void runRewardClaims("activity"));
     panel.claimAll.addEventListener("click", () => void runRewardClaims("all"));
+    panel.claimMail.addEventListener("click", () => void runRewardClaims("mail"));
     panel.buyAll.addEventListener("click", () => void purchaseMaterials(SHOP_TARGETS));
     for (const stopButton of shadow.querySelectorAll('[data-action="stop"]'))
       stopButton.addEventListener("click", () => {

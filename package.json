@@ -1,6 +1,6 @@
 {
   "name": "placegame-auto-helper",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "复古打宝挂机强化、金币材料、世界BOSS、自动爬塔与自动领奖桌面助手",
   "main": "main.js",
   "private": true,
@@ -39,11 +39,15 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "verifyUpdateCodeSignature": false

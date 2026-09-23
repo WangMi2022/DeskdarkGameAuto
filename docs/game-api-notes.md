@@ -24,6 +24,8 @@
 - 活动状态：`POST /api/client/view-sections`，`{sections:["quests","achievements","codex"]}`；仅处理 `canClaim === true && claimed !== true` 的任务、成就和图鉴奖励，分别调用 `/api/quests/claim {questKey}`、`/api/achievements/claim {achievementKey}`、`/api/codex/claim {rewardKey}`。
 - 每日活动还检查 `retention.signIn` 的当日未领取状态并调用 `/api/retention/sign-in`，以及按服务器每日进度计算已达成且未在 `daily.claimedActivity` 中的 20/40/60/80/100 活跃箱，调用 `/api/daily/claim {point}`。
 - 活动页的推币场只读取 `/api/arcade/coin-pusher/view`，在 `global.canClaim` 或 `guild.rewards[].canClaim` 为真且未领取时分别调用 `/api/arcade/coin-pusher/claim-global` 或 `/api/arcade/coin-pusher/claim-guild {point}`；不开始推币、不调用其他小游戏、彩票、市场兑换、捐献、购买或红包接口。每个领取请求使用幂等键，响应异常不自动重发。
+- 首领征伐：个人首领和地图首领使用 `POST /api/boss/challenge`（`{bossKey,difficulty,selectedSkillKeys,buffKey,affixKey,targetSlot?,useMaterialBoost?}`）；世界首领协作继续使用 `POST /api/boss/assist {bossKey}`。助手按首领类型分组，个人首领可设置追加挑战次数，地图首领支持多选和一键全选。
+- 系统邮件批量领取使用 `POST /api/mail/claim-all`，只在邮件存在未领取附件时提交，并使用幂等键；邮件状态来自 `/api/client/bootstrap` 的 `mails`。
 - 胜利后重新读取 tower 再挑战下一层。缺少终局、楼层未推进、网络异常、失败、达到目标、未解锁或封顶均停止。
 
 测试使用真实 Electron DOM 事件与请求封装，模拟响应不代表真实账号交易验证。
